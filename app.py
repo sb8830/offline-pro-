@@ -99,13 +99,33 @@ def fmt_inr(n):
     except Exception:
         return "₹0"
 
-def load_excel_or_csv(file):
-    """Load xlsx/xls/csv from an UploadedFile object."""
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    else:
-        return pd.read_excel(file, sheet_name=0)
+def load_excel_or_csv(file_obj, filename=None):
+    """
+    Supports both CSV and Excel files from BytesIO or UploadedFile.
+    Automatically detects type using filename or content fallback.
+    """
+    name = (filename or "").lower()
+
+    try:
+        # ✅ CSV handling
+        if name.endswith(".csv"):
+            return pd.read_csv(file_obj)
+
+        # ✅ Excel handling
+        elif name.endswith((".xlsx", ".xls")):
+            return pd.read_excel(file_obj, sheet_name=0)
+
+        # ✅ Fallback (auto-detect)
+        else:
+            try:
+                return pd.read_excel(file_obj, sheet_name=0)
+            except Exception:
+                file_obj.seek(0)
+                return pd.read_csv(file_obj)
+
+    except Exception as e:
+        file_obj.seek(0)
+        raise ValueError(f"Error reading file ({filename}): {e}")
 
 # ─────────────────────────────────────────────
 # COLUMN DETECTION
