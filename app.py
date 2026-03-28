@@ -141,8 +141,10 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
     c_trainer  = detect_col(sem, ["Trainer / Presenter","Trainer","Presenter","trainer"])
     c_semdate  = detect_col(sem, ["Seminar Date","Date","seminar_date","Event Date"])
     c_session  = detect_col(sem, ["Session","session","Batch","Time"])
-    c_attended = detect_col(sem, ["Is Attended ?","Attended","is_attended","attended"])
-    c_altmob   = detect_col(sem, ["Alternate Number","Alt Mobile","alternate_number"])
+    c_attended  = detect_col(sem, ["Is Attended ?","Attended","is_attended","attended"])
+    c_altmob    = detect_col(sem, ["Alternate Number","Alt Mobile","alternate_number"])
+    c_sem_amt   = detect_col(sem, ["Amount Paid","amount_paid","AmountPaid","Seat Amount"])
+    c_sem_mode  = detect_col(sem, ["Mode of Payment","Payment Mode","mode_of_payment","ModeOfPayment"])
 
     sem["mobile_clean"] = sem[c_mobile].apply(clean_mobile) if c_mobile else None
     sem["seminar_date"] = parse_date_series(sem[c_semdate]) if c_semdate else pd.NaT
@@ -174,7 +176,9 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
     conv["payment_received"]  = safe_numeric(conv[cc_payrec])  if cc_payrec  else 0
     conv["total_gst"]         = safe_numeric(conv[cc_gst])     if cc_gst     else 0
     conv["total_due"]         = safe_numeric(conv[cc_due])     if cc_due     else 0
-    conv["paid_amount"]       = conv["payment_received"] + conv["total_gst"]
+    conv["total_amount"]      = safe_numeric(conv[detect_col(conv,["total_amount","TotalAmount","Total Amount","course_amount"])]) if detect_col(conv,["total_amount","TotalAmount","Total Amount","course_amount"]) else 0
+    # paid_amount = payment_received ONLY (excluding GST)
+    conv["paid_amount"]       = conv["payment_received"]
     conv["service_name_clean"]= conv[cc_service].astype(str).str.strip() if cc_service else ""
 
     # ── LEADS ────────────────────────────────
@@ -228,22 +232,29 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
         mob     = row["mobile_clean"]
         sem_dt  = row["seminar_date"]
         entry = {
-            "name":         str(row.get(c_name, "")).strip() if c_name else "",
-            "mobile":       mob or "",
-            "place":        str(row.get(c_place, "")).strip() if c_place else "",
-            "trainer":      str(row.get(c_trainer, "")).strip() if c_trainer else "",
-            "seminar_date": sem_dt,
-            "session":      str(row.get(c_session, "")).strip().upper() if c_session else "",
-            "attended":     True,
-            "primary_course": "",
+            "name":              str(row.get(c_name, "")).strip() if c_name else "",
+            "mobile":            mob or "",
+            "place":             str(row.get(c_place, "")).strip() if c_place else "",
+            "trainer":           str(row.get(c_trainer, "")).strip() if c_trainer else "",
+            "seminar_date":      sem_dt,
+            "session":           str(row.get(c_session, "")).strip().upper() if c_session else "",
+            "attended":          True,
+            # Seminar day seat booking amount (from seminar CSV)
+            "seminar_seat_amount": float(safe_numeric(pd.Series([row.get(c_sem_amt, 0)])).iloc[0]) if c_sem_amt else 0.0,
+            "seminar_pay_mode":  str(row.get(c_sem_mode, "")).strip() if c_sem_mode else "",
+            "primary_course":    "",
             "primary_order_date": pd.NaT,
-            "primary_paid": 0.0,
-            "primary_due":  0.0,
+            "primary_paid":      0.0,
+            "primary_due":       0.0,
+            "primary_total_amount": 0.0,
             "additional_courses": [],
-            "additional_paid": 0.0,
-            "converted":    False,
-            "trainer_conv": "",
-            "sales_rep":    "",
+            "additional_paid":   0.0,
+            "all_courses":       [],   # ALL courses this student has
+            "all_paid_total":    0.0,  # total across all orders
+            "converted":         False,
+            "conv_status":       "Not Converted",   # Seat Booked | Partially Converted | Converted
+            "trainer_conv":      "",
+            "sales_rep":         "",
         }
 
         if mob and pd.notna(sem_dt):
@@ -258,10 +269,15 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
                     "Power Of Trading", na=False, case=False)]
                 primary = combo.iloc[0] if len(combo) > 0 else valid.iloc[0]
 
-                entry["primary_course"]     = primary["service_name_clean"]
-                entry["primary_order_date"] = primary["order_date_clean"]
-                entry["primary_paid"]       = float(primary["paid_amount"])
-                entry["primary_due"]        = float(primary["total_due"])
+                total_amt   = float(primary.get("total_amount", 0))
+                paid_amt    = float(primary["paid_amount"])
+                due_amt     = float(primary["total_due"])
+
+                entry["primary_course"]        = primary["service_name_clean"]
+                entry["primary_order_date"]    = primary["order_date_clean"]
+                entry["primary_paid"]          = paid_amt
+                entry["primary_due"]           = due_amt
+                entry["primary_total_amount"]  = total_amt
                 if cc_trainer:
                     entry["trainer_conv"] = str(primary.get(cc_trainer, "")).strip()
                 if cc_salesrep:
@@ -270,6 +286,24 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
                 others = valid[valid.index != primary.name]
                 entry["additional_courses"] = list(others["service_name_clean"].dropna().unique())
                 entry["additional_paid"]    = float(others["paid_amount"].sum())
+
+                # All courses (primary + additional)
+                entry["all_courses"]    = list(valid["service_name_clean"].dropna().unique())
+                entry["all_paid_total"] = float(valid["paid_amount"].sum())
+
+                # ── CONVERSION STATUS ─────────────────────────────────────────
+                # Seat Booked   : paid amount == seminar seat booking amount (or a small fixed amount like 999)
+                # Converted     : paid amount == total_amount (fully paid)
+                # Partially Conv: paid more than seat booking but less than total
+                seat_bk_amt = entry["seminar_seat_amount"]
+                # Define seat booking threshold: use seminar seat amount if > 0, else 999
+                seat_threshold = seat_bk_amt if seat_bk_amt > 0 else 999.0
+                if total_amt > 0 and paid_amt >= total_amt * 0.98:
+                    entry["conv_status"] = "Converted"
+                elif paid_amt > seat_threshold:
+                    entry["conv_status"] = "Partially Converted"
+                else:
+                    entry["conv_status"] = "Seat Booked"
 
         lead_info = get_lead(mob)
         entry.update(lead_info)
@@ -284,9 +318,16 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
         if col not in df.columns:
             df[col] = ""
 
-    df["seminar_date_str"] = df["seminar_date"].dt.strftime("%Y-%m-%d").fillna("")
+    df["seminar_date_str"]       = df["seminar_date"].dt.strftime("%Y-%m-%d").fillna("")
     df["primary_order_date_str"] = df["primary_order_date"].dt.strftime("%Y-%m-%d").fillna("")
-    df["due_zero"] = df["primary_due"] <= 0
+    df["due_zero"]               = df["primary_due"] <= 0
+    # Ensure new cols exist
+    for col in ["seminar_seat_amount","seminar_pay_mode","primary_total_amount",
+                "all_courses","all_paid_total","conv_status"]:
+        if col not in df.columns:
+            df[col] = "" if col in ["seminar_pay_mode","conv_status"] else 0
+    df["conv_status"] = df["conv_status"].fillna("Not Converted")
+    df.loc[~df["converted"], "conv_status"] = "Not Converted"
 
     return df
 
@@ -398,7 +439,7 @@ def render_filters(df):
     sel_trainer = st.sidebar.selectbox("👨‍🏫 Trainer",         opts("trainer"))
 
     st.sidebar.markdown("---")
-    sel_conv    = st.sidebar.selectbox("✅ Converted Status", ["All","Converted","Not Converted"])
+    sel_conv    = st.sidebar.selectbox("✅ Converted Status", ["All","Converted","Partially Converted","Seat Booked","Not Converted"])
     sel_course  = st.sidebar.selectbox("📚 Primary Course",   opts("primary_course"))
     add_courses_all = sorted(set(c for row in df["additional_courses"] for c in row if c))
     sel_addcourse = st.sidebar.selectbox("➕ Additional Course", ["All"] + add_courses_all)
@@ -434,8 +475,10 @@ def render_filters(df):
     if sel_place   != "All":    fdf = fdf[fdf["place"]   == sel_place]
     if sel_session != "All":    fdf = fdf[fdf["session"] == sel_session]
     if sel_trainer != "All":    fdf = fdf[fdf["trainer"] == sel_trainer]
-    if sel_conv == "Converted":     fdf = fdf[fdf["converted"]]
-    if sel_conv == "Not Converted": fdf = fdf[~fdf["converted"]]
+    if sel_conv == "Converted":           fdf = fdf[fdf["conv_status"] == "Converted"]
+    if sel_conv == "Partially Converted": fdf = fdf[fdf["conv_status"] == "Partially Converted"]
+    if sel_conv == "Seat Booked":         fdf = fdf[fdf["conv_status"] == "Seat Booked"]
+    if sel_conv == "Not Converted":       fdf = fdf[fdf["conv_status"] == "Not Converted"]
     if sel_course  != "All":    fdf = fdf[fdf["primary_course"] == sel_course]
     if sel_addcourse != "All":  fdf = fdf[fdf["additional_courses"].apply(lambda lst: sel_addcourse in lst)]
     if sel_due == "Due = 0":    fdf = fdf[fdf["primary_due"] <= 0]
@@ -469,11 +512,14 @@ def render_kpis(fdf):
     total   = len(fdf)
     n_conv  = len(conv)
     rate    = f"{(n_conv/total*100):.1f}%" if total else "0%"
+    # paid = payment_received only (no GST)
     t_paid  = fdf["primary_paid"].sum()
     t_due   = fdf["primary_due"].sum()
-    fp      = len(conv[conv["primary_due"] <= 0])
-    hd      = len(conv[conv["primary_due"] > 0])
-    uniq_c  = fdf["primary_course"].nunique()
+    t_sem_amt = fdf["seminar_seat_amount"].sum()  # seminar day seat booking
+    n_fully   = len(fdf[fdf["conv_status"] == "Converted"])
+    n_partial = len(fdf[fdf["conv_status"] == "Partially Converted"])
+    n_seat    = len(fdf[fdf["conv_status"] == "Seat Booked"])
+    n_not     = len(fdf[fdf["conv_status"] == "Not Converted"])
     wbn     = len(fdf[fdf["webinar_type"] == "Webinar"])
     non_wbn = len(fdf[fdf["webinar_type"] == "Non Webinar"])
     add_rev = fdf["additional_paid"].sum()
@@ -481,10 +527,10 @@ def render_kpis(fdf):
     cols = st.columns(5)
     cards = [
         ("Total Attendees",    total,           "Filtered seminar attendees",  "#6366f1"),
-        ("Converted",          n_conv,          "Post-seminar conversions",    "#10b981"),
-        ("Conversion Rate",    rate,            "Attend → Purchase rate",      "#06b6d4"),
-        ("Total Paid Amount",  fmt_inr(t_paid), "payment_received + GST",      "#f59e0b"),
-        ("Total Due",          fmt_inr(t_due),  "Outstanding dues",            "#ef4444"),
+        ("Converted",          n_fully,         "Fully paid (total = paid)",   "#10b981"),
+        ("Partially Converted",n_partial,       "Paid > seat booking amt",     "#f59e0b"),
+        ("Seat Booked",        n_seat,          "Paid = seat booking amount",  "#06b6d4"),
+        ("Not Converted",      n_not,           "No order found",              "#ef4444"),
     ]
     for i, (lbl, val, sub, clr) in enumerate(cards):
         cols[i].markdown(kpi_card(lbl, val, sub, clr), unsafe_allow_html=True)
@@ -492,16 +538,15 @@ def render_kpis(fdf):
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
     cols2 = st.columns(5)
     cards2 = [
-        ("Fully Paid",         fp,              "Due ≤ 0",                     "#10b981"),
-        ("Has Due",            hd,              "Pending balance",             "#ef4444"),
-        ("Unique Courses",     uniq_c,          "Distinct courses bought",     "#8b5cf6"),
+        ("Total Paid Amount",  fmt_inr(t_paid), "payment_received (excl. GST)","#f59e0b"),
+        ("Total Due",          fmt_inr(t_due),  "Outstanding dues",            "#ef4444"),
+        ("Seminar Seat Amount",fmt_inr(t_sem_amt),"Booking amount at venue",   "#8b5cf6"),
         ("Webinar Leads",      wbn,             "From webinar source",         "#06b6d4"),
         ("Non-Webinar Leads",  non_wbn,         "Offline / walk-in",           "#f97316"),
     ]
     for i, (lbl, val, sub, clr) in enumerate(cards2):
         cols2[i].markdown(kpi_card(lbl, val, sub, clr), unsafe_allow_html=True)
 
-    # Additional revenue row
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     cols3 = st.columns(5)
     cols3[0].markdown(kpi_card("Additional Revenue", fmt_inr(add_rev), "Cross-sell purchases", "#a855f7"), unsafe_allow_html=True)
@@ -834,82 +879,157 @@ def render_leads(fdf):
 def render_journey(fdf):
     st.markdown('<div class="section-header">🗺️ Student Journey Table</div>', unsafe_allow_html=True)
     search = st.text_input("🔍 Search students…", key="journey_search")
+
+    def to_excel_j(df_out):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_out.to_excel(writer, index=False)
+        return buf.getvalue()
+
     show = fdf[[
         "name","mobile","seminar_date_str","place","session","trainer","attended",
-        "primary_course","primary_order_date_str","primary_paid","primary_due",
-        "additional_courses","webinar_type","lead_source","lead_status","stage_name","lead_owner"
+        "conv_status","seminar_seat_amount","seminar_pay_mode",
+        "primary_course","primary_order_date_str","primary_paid","primary_total_amount","primary_due",
+        "additional_courses","all_paid_total",
+        "webinar_type","lead_source","lead_status","stage_name","lead_owner"
     ]].copy()
-    show["attended"] = show["attended"].map({True:"✅"})
-    show["primary_paid"] = show["primary_paid"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
-    show["primary_due"]  = show["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
-    show["additional_courses"] = show["additional_courses"].apply(lambda x: " | ".join(x) if x else "—")
+    show["attended"]             = show["attended"].map({True:"✅"})
+    show["seminar_seat_amount"]  = show["seminar_seat_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+    show["primary_paid"]         = show["primary_paid"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+    show["primary_total_amount"] = show["primary_total_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+    show["primary_due"]          = show["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
+    show["all_paid_total"]       = show["all_paid_total"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+    show["additional_courses"]   = show["additional_courses"].apply(lambda x: " | ".join(x) if x else "—")
     show.columns = ["Name","Mobile","Seminar Date","Location","Session","Trainer","Attended",
-                    "Primary Course","Order Date","Paid","Due","Additional Courses",
+                    "Status","Seat Booking Amt","Pay Mode",
+                    "Primary Course","Order Date","Paid (excl. GST)","Course Amount","Due",
+                    "Additional Courses","Total Revenue",
                     "Lead Type","Source","Lead Status","Stage","Owner"]
     if search:
         mask = show.apply(lambda row: row.astype(str).str.contains(search, case=False).any(), axis=1)
         show = show[mask]
     st.caption(f"{len(show)} students")
     st.dataframe(show, use_container_width=True, hide_index=True, height=500)
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ Download CSV",   show.to_csv(index=False).encode(), "journey.csv",  "text/csv",             use_container_width=True)
+    c2.download_button("⬇️ Download Excel", to_excel_j(show),                 "journey.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 
 # ─────────────────────────────────────────────
 # DATA TABLES
 # ─────────────────────────────────────────────
 def render_tables(fdf):
-    tab1, tab2, tab3 = st.tabs(["📋 Attendee Master", "✅ Converted Students", "📦 All Orders Summary"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Attendee Master", "✅ Converted Students", "📦 Location Summary", "🎓 Student Course Portfolio"])
+
+    def to_excel(df_out):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_out.to_excel(writer, index=False)
+        return buf.getvalue()
 
     with tab1:
         search = st.text_input("🔍 Search attendees…", key="att_search")
         show = fdf[["name","mobile","place","seminar_date_str","session","trainer",
-                    "converted","primary_course","primary_paid","primary_due"]].copy()
-        show["converted"]    = show["converted"].map({True:"✅ Yes", False:"❌ No"})
-        show["primary_paid"] = show["primary_paid"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
-        show["primary_due"]  = show["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
-        show.columns = ["Name","Mobile","Location","Seminar Date","Session","Trainer","Converted","Course","Paid","Due"]
+                    "conv_status","seminar_seat_amount","seminar_pay_mode",
+                    "primary_course","primary_paid","primary_due","primary_total_amount",
+                    "webinar_type","lead_source","campaign_name","lead_owner"]].copy()
+        show["seminar_seat_amount"] = show["seminar_seat_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+        show["primary_paid"]        = show["primary_paid"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+        show["primary_due"]         = show["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
+        show["primary_total_amount"]= show["primary_total_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+        show.columns = ["Name","Mobile","Location","Seminar Date","Session","Trainer",
+                        "Status","Seat Booking Amt","Payment Mode",
+                        "Course","Paid (excl. GST)","Due","Course Amount",
+                        "Lead Type","Source","Campaign","Owner"]
         if search:
             mask = show.apply(lambda row: row.astype(str).str.contains(search, case=False).any(), axis=1)
             show = show[mask]
         st.caption(f"{len(show)} attendees")
-        st.dataframe(show, use_container_width=True, hide_index=True, height=400)
-        csv = show.to_csv(index=False).encode()
-        st.download_button("⬇️ Download CSV", csv, "attendees.csv", "text/csv")
+        st.dataframe(show, use_container_width=True, hide_index=True, height=420)
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ Download CSV",   show.to_csv(index=False).encode(), "attendees.csv",  "text/csv",             use_container_width=True)
+        c2.download_button("⬇️ Download Excel", to_excel(show),                   "attendees.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
     with tab2:
-        conv = fdf[fdf["converted"]].copy()
-        search2 = st.text_input("🔍 Search converted students…", key="conv_search")
-        show2 = conv[["name","mobile","place","seminar_date_str","primary_course",
-                       "primary_order_date_str","primary_paid","primary_due",
-                       "additional_courses","webinar_type","lead_source"]].copy()
-        show2["primary_paid"] = show2["primary_paid"].apply(fmt_inr)
-        show2["primary_due"]  = show2["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
-        show2["additional_courses"] = show2["additional_courses"].apply(lambda x: " | ".join(x) if x else "—")
-        show2.columns = ["Name","Mobile","Location","Seminar Date","Course","Order Date","Paid","Due",
-                          "Additional Courses","Lead Type","Source"]
+        # Filter by conv_status
+        stat_filter = st.selectbox("Filter by status", ["All","Converted","Partially Converted","Seat Booked"], key="t2_sf")
+        conv_base = fdf[fdf["converted"]].copy()
+        if stat_filter != "All":
+            conv_base = conv_base[conv_base["conv_status"] == stat_filter]
+        search2 = st.text_input("🔍 Search…", key="conv_search")
+        show2 = conv_base[["name","mobile","place","seminar_date_str","conv_status",
+                            "seminar_seat_amount","primary_course",
+                            "primary_order_date_str","primary_paid","primary_total_amount","primary_due",
+                            "additional_courses","webinar_type","lead_source","sales_rep"]].copy()
+        show2["seminar_seat_amount"]  = show2["seminar_seat_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+        show2["primary_paid"]         = show2["primary_paid"].apply(fmt_inr)
+        show2["primary_due"]          = show2["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
+        show2["primary_total_amount"] = show2["primary_total_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+        show2["additional_courses"]   = show2["additional_courses"].apply(lambda x: " | ".join(x) if x else "—")
+        show2.columns = ["Name","Mobile","Location","Seminar Date","Status",
+                         "Seat Booking Amt","Course","Order Date","Paid (excl. GST)","Course Amount","Due",
+                         "Additional Courses","Lead Type","Source","Sales Rep"]
         if search2:
             mask = show2.apply(lambda row: row.astype(str).str.contains(search2, case=False).any(), axis=1)
             show2 = show2[mask]
-        st.caption(f"{len(show2)} converted students")
-        st.dataframe(show2, use_container_width=True, hide_index=True, height=400)
-        csv2 = show2.to_csv(index=False).encode()
-        st.download_button("⬇️ Download CSV", csv2, "converted_students.csv", "text/csv")
+        st.caption(f"{len(show2)} students")
+        st.dataframe(show2, use_container_width=True, hide_index=True, height=420)
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ Download CSV",   show2.to_csv(index=False).encode(), "converted.csv",  "text/csv",             use_container_width=True)
+        c2.download_button("⬇️ Download Excel", to_excel(show2),                   "converted.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
     with tab3:
         summary = fdf.groupby("place").agg(
             Attendees=("attended","count"),
-            Converted=("converted","sum"),
+            Converted=("conv_status", lambda x: (x=="Converted").sum()),
+            Partially=("conv_status", lambda x: (x=="Partially Converted").sum()),
+            SeatBooked=("conv_status", lambda x: (x=="Seat Booked").sum()),
             Total_Paid=("primary_paid","sum"),
+            Sem_Amt=("seminar_seat_amount","sum"),
             Total_Due=("primary_due","sum"),
             Add_Revenue=("additional_paid","sum"),
         ).reset_index()
         summary["Conv Rate"] = (summary["Converted"] / summary["Attendees"] * 100).round(1).astype(str) + "%"
-        summary["Total_Paid"] = summary["Total_Paid"].apply(fmt_inr)
-        summary["Total_Due"]  = summary["Total_Due"].apply(fmt_inr)
-        summary["Add_Revenue"] = summary["Add_Revenue"].apply(fmt_inr)
-        summary.columns = ["Location","Attendees","Converted","Total Paid","Total Due","Add. Revenue","Conv Rate"]
+        for c in ["Total_Paid","Sem_Amt","Total_Due","Add_Revenue"]:
+            summary[c] = summary[c].apply(fmt_inr)
+        summary.columns = ["Location","Attendees","Converted","Partially Conv","Seat Booked",
+                           "Total Paid","Sem Seat Amt","Total Due","Add. Revenue","Conv Rate"]
         st.dataframe(summary, use_container_width=True, hide_index=True)
-        csv3 = summary.to_csv(index=False).encode()
-        st.download_button("⬇️ Download CSV", csv3, "location_summary.csv", "text/csv")
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ Download CSV",   summary.to_csv(index=False).encode(), "location_summary.csv",  "text/csv",             use_container_width=True)
+        c2.download_button("⬇️ Download Excel", to_excel(summary),                   "location_summary.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+    with tab4:
+        st.markdown('<div class="section-header">🎓 Student Course Portfolio — How many courses per student</div>', unsafe_allow_html=True)
+        search4 = st.text_input("🔍 Search student…", key="port_search")
+        conv4 = fdf[fdf["converted"]].copy()
+        conv4["num_courses"] = conv4["all_courses"].apply(len)
+        conv4["all_courses_str"] = conv4["all_courses"].apply(lambda x: " | ".join(x) if x else "—")
+        show4 = conv4[["name","mobile","place","seminar_date_str","conv_status",
+                        "num_courses","all_courses_str","all_paid_total",
+                        "seminar_seat_amount","primary_course","primary_paid","primary_due"]].copy()
+        show4["all_paid_total"]      = show4["all_paid_total"].apply(fmt_inr)
+        show4["seminar_seat_amount"] = show4["seminar_seat_amount"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+        show4["primary_paid"]        = show4["primary_paid"].apply(fmt_inr)
+        show4["primary_due"]         = show4["primary_due"].apply(lambda x: fmt_inr(x) if x > 0 else "₹0")
+        show4.columns = ["Name","Mobile","Location","Seminar Date","Status",
+                         "# Courses","All Courses","Total Revenue","Seat Booking Amt",
+                         "Primary Course","Paid (excl. GST)","Due"]
+        if search4:
+            mask = show4.apply(lambda row: row.astype(str).str.contains(search4, case=False).any(), axis=1)
+            show4 = show4[mask]
+        # KPIs
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        kc1.markdown(kpi_card("Students with 1 course",  len(conv4[conv4["num_courses"]==1]), "", "#6366f1"), unsafe_allow_html=True)
+        kc2.markdown(kpi_card("Students with 2+ courses",len(conv4[conv4["num_courses"]>=2]), "", "#10b981"), unsafe_allow_html=True)
+        kc3.markdown(kpi_card("Max courses by 1 student",int(conv4["num_courses"].max()) if len(conv4) else 0, "", "#f59e0b"), unsafe_allow_html=True)
+        kc4.markdown(kpi_card("Total Portfolio Revenue", fmt_inr(conv4["all_paid_total"].sum()), "All orders combined", "#06b6d4"), unsafe_allow_html=True)
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        st.caption(f"{len(show4)} students")
+        st.dataframe(show4.sort_values("# Courses", ascending=False), use_container_width=True, hide_index=True, height=420)
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ Download CSV",   show4.to_csv(index=False).encode(), "portfolio.csv",  "text/csv",             use_container_width=True)
+        c2.download_button("⬇️ Download Excel", to_excel(show4),                   "portfolio.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 
 # ─────────────────────────────────────────────
@@ -959,7 +1079,7 @@ def main():
         "🔗 Combo Cross-Sell",
         "🎯 Lead Intelligence",
         "🗺️ Student Journey",
-        "📋 Data Tables",
+        "📋 Data Tables & Export",
     ])
 
     with tabs[0]:
