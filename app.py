@@ -152,7 +152,7 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
     Cache key uses file names + sizes (passed as strings).
     """
     # ── SEMINAR ──────────────────────────────
-    sem = load_excel_or_csv(io.BytesIO(sem_bytes))
+    sem = load_excel_or_csv(io.BytesIO(sem_bytes), sem_name)
     sem.columns = [str(c).strip() for c in sem.columns]
 
     c_mobile   = detect_col(sem, ["Mobile","Phone","mobile","phone","Contact"])
@@ -176,7 +176,7 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
     attendees = sem[sem["attended_flag"]].copy().reset_index(drop=True)
 
     # ── CONVERSION ───────────────────────────
-    conv = load_excel_or_csv(io.BytesIO(conv_bytes))
+    conv = load_excel_or_csv(io.BytesIO(conv_bytes), conv_name)
     conv.columns = [str(c).strip() for c in conv.columns]
 
     cc_mobile   = detect_col(conv, ["phone","Phone","mobile","Mobile","Contact"])
@@ -202,7 +202,7 @@ def process_data(sem_bytes, conv_bytes, leads_bytes,
     conv["service_name_clean"]= conv[cc_service].astype(str).str.strip() if cc_service else ""
 
     # ── LEADS ────────────────────────────────
-    leads = load_excel_or_csv(io.BytesIO(leads_bytes))
+    leads = load_excel_or_csv(io.BytesIO(leads_bytes), leads_name)
     leads.columns = [str(c).strip() for c in leads.columns]
 
     lc_mobile   = detect_col(leads, ["phone","Phone","mobile","Mobile"])
